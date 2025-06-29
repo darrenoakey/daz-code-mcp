@@ -1,6 +1,6 @@
-# Code Indexer and Search
+![](banner.jpg)
 
-[![Banner Image](banner.jpg)](banner.jpg)
+# Code Indexer and Search
 
 ## Purpose
 
@@ -27,7 +27,7 @@ This project provides tools to index code repositories and search through them e
 
 ### 1. Indexing Code
 
-Use `code-scan.py` to index a git repository. This script scans the repository, extracts code elements, and stores them in a ChromaDB database.
+Use `code-scan.py` to index a git repository. This script scans the repository and stores code elements in a ChromaDB database.
 
 ```bash
 python code-scan.py <repo_path> [repo_name]

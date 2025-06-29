@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Git Repository Code Scanner with ChromaDB Vector Database Indexing
-Watches for changes in git repository and indexes content with advanced code parsing
+Memory-optimized version with batch processing and garbage collection
 """
 
 import os
@@ -10,6 +10,7 @@ import time
 import hashlib
 import logging
 import subprocess
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import json
@@ -90,12 +91,14 @@ def setup_tree_sitter():
 # Load tree-sitter languages
 LANGUAGES = setup_tree_sitter()
 
-# Constants
-CHUNK_SIZE = 1024
-OVERLAP_SIZE = 256
+# Constants - reduced for memory efficiency
+CHUNK_SIZE = 512  # Reduced from 1024
+OVERLAP_SIZE = 128  # Reduced from 256
 STEP_SIZE = CHUNK_SIZE - OVERLAP_SIZE
 COLLECTION_NAME = "code_chunks"
 METADATA_FILE = ".code_indexer_metadata.json"
+BATCH_SIZE = 50  # Process files in batches
+MAX_FILE_SIZE = 1024 * 1024  # Skip files larger than 1MB to save memory
 
 # Language mappings - updated to include tsx
 LANGUAGE_EXTENSIONS = {
@@ -114,6 +117,17 @@ LANGUAGE_EXTENSIONS = {
     ".go": "go",
     ".rs": "rust",
 }
+
+
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    import psutil
+
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0
 
 
 def get_git_files(repo_path: Path) -> Set[str]:
@@ -189,6 +203,10 @@ def extract_code_elements(content: str, language: str, filepath: str) -> List[Di
         elements = []
 
         def traverse_node(node, depth=0):
+            # Limit recursion depth to avoid stack overflow on large files
+            if depth > 50:
+                return
+
             # Extract functions
             if node.type in [
                 "function_definition",
@@ -210,6 +228,11 @@ def extract_code_elements(content: str, language: str, filepath: str) -> List[Di
                 if name_node:
                     func_name = content[name_node.start_byte : name_node.end_byte]
                     func_text = content[node.start_byte : node.end_byte]
+
+                    # Limit function text size to save memory
+                    if len(func_text) > 10000:
+                        func_text = func_text[:10000] + "... [truncated]"
+
                     elements.append(
                         {
                             "type": "function",
@@ -239,6 +262,11 @@ def extract_code_elements(content: str, language: str, filepath: str) -> List[Di
                 if name_node:
                     class_name = content[name_node.start_byte : name_node.end_byte]
                     class_text = content[node.start_byte : node.end_byte]
+
+                    # Limit class text size to save memory
+                    if len(class_text) > 10000:
+                        class_text = class_text[:10000] + "... [truncated]"
+
                     elements.append(
                         {
                             "type": "class",
@@ -314,6 +342,20 @@ class CodeRepositoryIndexer:
         except Exception as e:
             logger.error(f"Error saving metadata: {e}")
 
+    def clear_collection(self):
+        """Clear all data from the collection"""
+        try:
+            self.client.delete_collection(self.collection_name)
+            self.collection = self.client.create_collection(
+                name=self.collection_name, metadata={"hnsw:space": "cosine"}
+            )
+            # Clear metadata file
+            self.file_hashes = {}
+            self.save_metadata()
+            logger.info(f"Cleared collection: {self.collection_name}")
+        except Exception as e:
+            logger.error(f"Error clearing collection: {e}")
+
     def remove_file_chunks(self, filepath: str):
         """Remove all chunks for a given file from the database"""
         try:
@@ -325,7 +367,7 @@ class CodeRepositoryIndexer:
             logger.error(f"Error removing chunks for {filepath}: {e}")
 
     def index_file(self, filepath: Path):
-        """Index a single file"""
+        """Index a single file with memory optimization"""
         relative_path = str(filepath.relative_to(self.repo_path))
 
         # Skip if not in git
@@ -333,9 +375,22 @@ class CodeRepositoryIndexer:
             return
 
         try:
+            # Check file size first
+            file_size = filepath.stat().st_size
+            if file_size > MAX_FILE_SIZE:
+                logger.warning(
+                    f"Skipping large file {relative_path} ({file_size} bytes)"
+                )
+                return
+
             # Read file content
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
+
+            # Skip very large files in memory too
+            if len(content) > MAX_FILE_SIZE:
+                logger.warning(f"Skipping large content file {relative_path}")
+                return
 
             # Calculate hash
             current_hash = calculate_file_hash(filepath)
@@ -352,16 +407,18 @@ class CodeRepositoryIndexer:
             if relative_path in self.file_hashes:
                 self.remove_file_chunks(relative_path)
 
-            # Prepare data for ChromaDB
-            ids = []
-            documents = []
-            metadatas = []
+            # Prepare data for ChromaDB in smaller batches
+            all_ids = []
+            all_documents = []
+            all_metadatas = []
 
             # Add filename chunk
             filename_id = f"{self.repo_name}_{relative_path}_filename"
-            ids.append(filename_id)
-            documents.append(f"{filepath.name}\n{content}")
-            metadatas.append(
+            all_ids.append(filename_id)
+            # Truncate content preview to save memory
+            content_preview = content[:1000] + "..." if len(content) > 1000 else content
+            all_documents.append(f"{filepath.name}\n{content_preview}")
+            all_metadatas.append(
                 {
                     "file_path": relative_path,
                     "repo_name": self.repo_name,
@@ -371,13 +428,17 @@ class CodeRepositoryIndexer:
                 }
             )
 
-            # Regular content chunks
+            # Regular content chunks (fewer chunks to save memory)
             content_chunks = chunk_content(content)
-            for i, (chunk_text, start_pos, end_pos) in enumerate(content_chunks):
+            # Limit number of chunks per file
+            max_chunks = min(len(content_chunks), 20)
+            for i, (chunk_text, start_pos, end_pos) in enumerate(
+                content_chunks[:max_chunks]
+            ):
                 chunk_id = f"{self.repo_name}_{relative_path}_chunk_{i}"
-                ids.append(chunk_id)
-                documents.append(chunk_text)
-                metadatas.append(
+                all_ids.append(chunk_id)
+                all_documents.append(chunk_text)
+                all_metadatas.append(
                     {
                         "file_path": relative_path,
                         "repo_name": self.repo_name,
@@ -389,17 +450,20 @@ class CodeRepositoryIndexer:
                     }
                 )
 
-            # Code element chunks (functions and classes)
+            # Code element chunks (functions and classes) - limit to save memory
             file_extension = filepath.suffix.lower()
             if file_extension in LANGUAGE_EXTENSIONS:
                 language = LANGUAGE_EXTENSIONS[file_extension]
                 code_elements = extract_code_elements(content, language, relative_path)
 
-                for element in code_elements:
-                    element_id = f"{self.repo_name}_{relative_path}_{element['type']}_{element['name']}"
-                    ids.append(element_id)
-                    documents.append(element["text"])
-                    metadatas.append(
+                # Limit number of code elements to save memory
+                max_elements = min(len(code_elements), 50)
+                for element in code_elements[:max_elements]:
+                    # Make ID unique by including start_byte position
+                    element_id = f"{self.repo_name}_{relative_path}_{element['type']}_{element['name']}_{element['start_byte']}"
+                    all_ids.append(element_id)
+                    all_documents.append(element["text"])
+                    all_metadatas.append(
                         {
                             "file_path": relative_path,
                             "repo_name": self.repo_name,
@@ -412,15 +476,31 @@ class CodeRepositoryIndexer:
                         }
                     )
 
-            # Add to ChromaDB
-            if ids:
-                self.collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            # Add to ChromaDB in smaller batches
+            if all_ids:
+                # Process in small batches to avoid memory issues
+                batch_size = 100
+                for i in range(0, len(all_ids), batch_size):
+                    batch_ids = all_ids[i : i + batch_size]
+                    batch_docs = all_documents[i : i + batch_size]
+                    batch_meta = all_metadatas[i : i + batch_size]
+
+                    self.collection.add(
+                        ids=batch_ids, documents=batch_docs, metadatas=batch_meta
+                    )
 
                 # Update hash
                 self.file_hashes[relative_path] = current_hash
                 self.save_metadata()
 
-                logger.info(f"Indexed {len(ids)} chunks for {relative_path}")
+                logger.info(f"Indexed {len(all_ids)} chunks for {relative_path}")
+
+            # Clear variables to free memory
+            del content, all_ids, all_documents, all_metadatas
+            if "code_elements" in locals():
+                del code_elements
+            if "content_chunks" in locals():
+                del content_chunks
 
         except Exception as e:
             logger.error(f"Error indexing {filepath}: {e}")
@@ -444,17 +524,43 @@ class CodeRepositoryIndexer:
         self.git_files = get_git_files(self.repo_path)
 
     def initial_index(self):
-        """Perform initial indexing of all git-tracked files"""
-        logger.info("Starting initial index...")
+        """Perform initial indexing with memory management"""
+        logger.info("Starting initial index with memory optimization...")
 
+        git_files_list = list(self.git_files)
+        total_files = len(git_files_list)
         indexed_count = 0
-        for relative_path in self.git_files:
-            filepath = self.repo_path / relative_path
-            if filepath.exists() and filepath.is_file():
-                self.index_file(filepath)
-                indexed_count += 1
-                if indexed_count % 10 == 0:
-                    logger.info(f"Progress: {indexed_count} files indexed")
+
+        # Process files in batches
+        for i in range(0, total_files, BATCH_SIZE):
+            batch_files = git_files_list[i : i + BATCH_SIZE]
+
+            for relative_path in batch_files:
+                filepath = self.repo_path / relative_path
+                if filepath.exists() and filepath.is_file():
+                    self.index_file(filepath)
+                    indexed_count += 1
+
+                    if indexed_count % 100 == 0:
+                        memory_mb = get_memory_usage()
+                        logger.info(
+                            f"Progress: {indexed_count}/{total_files} files indexed, Memory: {memory_mb:.1f}MB"
+                        )
+
+            # Force garbage collection after each batch
+            gc.collect()
+
+            # Log memory usage
+            memory_mb = get_memory_usage()
+            logger.info(
+                f"Batch complete. {indexed_count}/{total_files} files, Memory: {memory_mb:.1f}MB"
+            )
+
+            # If memory usage is too high, warn and consider pausing
+            if memory_mb > 2000:  # 2GB threshold
+                logger.warning(
+                    f"High memory usage: {memory_mb:.1f}MB. Consider reducing batch size."
+                )
 
         logger.info(f"Initial index complete. Indexed {indexed_count} files.")
 
@@ -466,10 +572,13 @@ class CodeRepositoryEventHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
             filepath = Path(event.src_path)
-            relative_path = str(filepath.relative_to(self.indexer.repo_path))
-            if relative_path in self.indexer.git_files:
-                logger.info(f"File created: {event.src_path}")
-                self.indexer.index_file(filepath)
+            try:
+                relative_path = str(filepath.relative_to(self.indexer.repo_path))
+                if relative_path in self.indexer.git_files:
+                    logger.info(f"File created: {event.src_path}")
+                    self.indexer.index_file(filepath)
+            except ValueError:
+                pass
 
     def on_modified(self, event):
         if not event.is_directory:
@@ -533,9 +642,10 @@ def main():
     try:
         while True:
             time.sleep(5)  # Light sleep to reduce CPU usage
-            # Periodically refresh git files list
+            # Periodically refresh git files list and run garbage collection
             if time.time() % 60 < 5:  # Every minute or so
                 indexer.update_git_files()
+                gc.collect()
     except KeyboardInterrupt:
         observer.stop()
         logger.info("Stopping file watcher...")
