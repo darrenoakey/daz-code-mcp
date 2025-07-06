@@ -1,0 +1,9 @@
+#!/bin/bash
+
+echo creating dot
+callgraph ./sample x.dot
+echo rendering
+dot -Tpng x.dot >x.png
+echo opening
+open x.png
+

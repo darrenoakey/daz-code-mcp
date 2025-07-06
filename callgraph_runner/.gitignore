@@ -1,0 +1,14 @@
+# Node
+node_modules/
+dist/
+coverage/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / misc
+*.log
+*.tmp
+*.swp

@@ -1,1 +1,4 @@
 code_chromadb/
+play/
+.DS_Store
+code_callgraph.sqlite

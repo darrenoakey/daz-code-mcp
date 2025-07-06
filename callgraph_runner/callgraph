@@ -1,0 +1,16 @@
+#!/bin/bash
+# callgraph -- bash version
+# 1. If node_modules/ doesn't exist, run npm install
+# 2. Then run: npx tsx parseCallGraph.ts "$@"
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -d node_modules ]; then
+  echo "callgraph: installing dependencies..."
+  npm install
+fi
+
+npx tsx parseCallGraph.ts "$@"
